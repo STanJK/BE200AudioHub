@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use bumble_hci::metadata::supported_command_names;
 use bumble_host::{IsoControlEvent, IsoDataPathParameters, IsoTxSyncInfo};
 use bumble_transport::{ExternalHostActivity, ExternalHostState};
-use iso_scheduler::first_sound::{pair_fits, StereoPacer};
+use iso_scheduler::first_sound::{pair_fits, StereoPacer, CREDIT_STALL_TIMEOUT};
 use crate::{AttachedController, IsoTxStats, ProbeGuard};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -216,19 +216,27 @@ impl AttachedController {
         self.iso_audit.lock().map_err(|_|"ISO audit mutex poisoned")?.begin(handles,capacity)?;
         let result=(|| -> Result<IsoStreamReport,String> {
             let start=Instant::now();
-            let pacer=StereoPacer::new(start+Duration::from_millis(20));
+            let mut pacer=StereoPacer::new(start+Duration::from_millis(20));
             let mut max_lateness_us=0u64;
+            let mut pacing_rebases=0u64;
             for (index,(left,right)) in frames.iter().enumerate() {
-                let deadline=pacer.deadline(index as u32);
+                let deadline=pacer.deadline();
+                let mut credit_blocked_since=None::<Instant>;
                 loop {
                     ProbeGuard::check_cancelled()?;
                     self.poll_iso_transport()?; self.require_iso_links(handles,acls)?;
                     self.iso_tx_snapshot()?.check()?;
                     let now=Instant::now();
-                    let late=pacer.lateness(index as u32,now)?;
                     let pending=self.device.iso_packets_pending().ok_or("ISO queue disappeared")?;
-                    if now>=deadline && pair_fits(pending,capacity) {
-                        max_lateness_us=max_lateness_us.max(late.as_micros() as u64); break;
+                    if now>=deadline {
+                        if pair_fits(pending,capacity) { break; }
+                        let blocked=*credit_blocked_since.get_or_insert(now);
+                        if now.duration_since(blocked) >= CREDIT_STALL_TIMEOUT {
+                            return Err(format!(
+                                "ISO credit starvation for {}ms at frame {index}: pending={pending}/{capacity}",
+                                CREDIT_STALL_TIMEOUT.as_millis()
+                            ));
+                        }
                     }
                     let wait=deadline.saturating_duration_since(now);
                     self.wait_iso_activity(if wait.is_zero(){POLL_SLICE}else{wait.min(POLL_SLICE)})?;
@@ -241,12 +249,24 @@ impl AttachedController {
                 if !self.device.send_iso_sdu(&mut self.host,handles[1],right) {
                     return Err(format!("right ISO SDU submission failed after left at frame {index}; abort both, not retried"));
                 }
+                let pacing=pacer.submitted(Instant::now());
+                max_lateness_us=max_lateness_us.max(pacing.lateness.as_micros() as u64);
+                if pacing.rebased {
+                    pacing_rebases+=1;
+                    if pacing_rebases<=10 || pacing_rebases%10==0 {
+                        println!(
+                            "[R5.3-C/PACE] rebase={} frame={} late={}us; no catch-up burst",
+                            pacing_rebases,index,pacing.lateness.as_micros()
+                        );
+                    }
+                }
                 self.iso_tx_snapshot()?.check()?;
                 if index==0 || (index+1)%100==0 {
                     let s=self.iso_tx_snapshot()?;
-                    println!("[R5.3-C/TX] pairs={}/{} submitted={:?} completed={:?} pending={} max_late={}us",index+1,frames.len(),s.submitted,s.completed,s.pending(),max_lateness_us);
+                    println!("[R5.3-C/TX] pairs={}/{} submitted={:?} completed={:?} pending={} max_late={}us rebases={}",index+1,frames.len(),s.submitted,s.completed,s.pending(),max_lateness_us,pacing_rebases);
                 }
             }
+            println!("[R5.3-C/PACE] source complete: rebases={pacing_rebases} max_late={max_lateness_us}us");
             self.drain_iso_output(handles)?;
             self.require_iso_links(handles,acls)?;
             let tx=self.iso_tx_snapshot()?; tx.verify_complete(frames.len() as u64)?;
