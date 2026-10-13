@@ -16,7 +16,11 @@ use rusb::{
 
 const BE200_VID: u16 = 0x8087;
 const BE200_PID: u16 = 0x0036;
-const READ_TIMEOUT: Duration = Duration::from_millis(10);
+const EVENT_READ_TIMEOUT: Duration = Duration::from_millis(10);
+// Do not let an idle ACL bulk-IN read hold up HCI event credits during ISO.
+// Number Of Completed Packets arrives on interrupt-IN and directly replenishes
+// the controller ISO queue; a 10 ms bulk poll here can miss an entire CIS interval.
+const ACL_READ_TIMEOUT: Duration = Duration::from_millis(1);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Product-local BE200 USB transport.
@@ -383,7 +387,7 @@ impl Be200UsbPacketSource {
             self.handle.as_ref(),
             self.interrupt_in,
             &mut transfer,
-            READ_TIMEOUT,
+            EVENT_READ_TIMEOUT,
         )?;
         if count == 0 {
             return Ok(());
@@ -396,7 +400,7 @@ impl Be200UsbPacketSource {
         let mut transfer = vec![0u8; MAX_HCI_PACKET_SIZE - 1];
         let count = match self
             .handle
-            .read_bulk(self.bulk_in, &mut transfer, READ_TIMEOUT)
+            .read_bulk(self.bulk_in, &mut transfer, ACL_READ_TIMEOUT)
         {
             Ok(count) => count,
             Err(rusb::Error::Timeout) => return Ok(()),
