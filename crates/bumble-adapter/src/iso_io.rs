@@ -171,17 +171,16 @@ impl AttachedController {
 
     /// Bounded synthetic First Sound sender.
     ///
-    /// AOSP's LE Audio media clock is independent of HCI credit-return timing:
-    /// a real-time 10 ms audio tick feeds IsoManager while lower HCI queues own
-    /// controller flow control. Our test source is already fully encoded, so we
-    /// can model the same separation more strongly: enqueue the complete bounded
-    /// clip into Bumble's host-side ISO queue and let the controller's eight ISO
-    /// buffers plus Number Of Completed Packets events clock USB submission.
-    /// This deliberately avoids turning batched HCI completions into an audio
-    /// clock, which caused the R5.3-2 pitch modulation and bursty playback.
+    /// AOSP drives LC3 from an independent media tick and leaves HCI flow
+    /// control below that clock. Bumble-RS already implements the lower half:
+    /// send_iso_sdu() appends to a host queue, while Number Of Completed
+    /// Packets only releases controller credits and flushes more queued HCI ISO
+    /// packets. Keep a small software backlog here instead of making credit
+    /// return timing the 10 ms media clock.
     pub fn transmit_stereo_iso(
         &mut self, handles:[u16;2], acls:[u16;2], frames:&[(&[u8],&[u8])],
     ) -> Result<IsoStreamReport,String> {
+        const SOFTWARE_BACKLOG_PAIRS: usize = 10; // 100 ms at one pair / 10 ms.
         const PROGRESS_TIMEOUT: Duration = Duration::from_millis(750);
         if handles[0]==handles[1] || acls[0]==acls[1] || frames.is_empty() || frames.len()>3_000
             || frames.iter().any(|(l,r)|l.len()!=100 || r.len()!=100)
@@ -199,27 +198,37 @@ impl AttachedController {
         self.iso_audit.lock().map_err(|_|"ISO audit mutex poisoned")?.begin(handles,capacity)?;
         let result=(|| -> Result<IsoStreamReport,String> {
             let start=Instant::now();
-
-            for (index,(left,right)) in frames.iter().enumerate() {
-                ProbeGuard::check_cancelled()?;
-                if !self.device.send_iso_sdu(&mut self.host,handles[0],left) {
-                    return Err(format!("left ISO SDU enqueue failed at frame {index}"));
-                }
-                if !self.device.send_iso_sdu(&mut self.host,handles[1],right) {
-                    return Err(format!("right ISO SDU enqueue failed at frame {index}"));
-                }
-            }
-            let queued=self.device.iso_packets_pending().ok_or("ISO queue disappeared after prequeue")?;
-            println!(
-                "[R5.3-C/QUEUE] {} stereo pairs queued; HCI window={} packets; pending={} packets; controller completion clock owns drain",
-                frames.len(),capacity,queued
-            );
-
+            let target_pending=(SOFTWARE_BACKLOG_PAIRS*2).max(capacity);
+            let mut next_frame=0usize;
             let mut last_progress=Instant::now();
             let mut last_completed=0u64;
             let mut next_report=100u64;
+
+            println!(
+                "[R5.3-C/QUEUE] controller_window={} packets; software_target={} packets (~{}ms); source clock is decoupled from HCI credit events",
+                capacity,target_pending,SOFTWARE_BACKLOG_PAIRS*10
+            );
+
             loop {
                 ProbeGuard::check_cancelled()?;
+                self.require_iso_links(handles,acls)?;
+
+                // Refill an alternating L/R FIFO up to a bounded backlog. Do
+                // not wait for a particular credit count before producing the
+                // next SDU pair; Bumble's DataPacketQueue owns that flow control.
+                while next_frame<frames.len() {
+                    let pending=self.device.iso_packets_pending().ok_or("ISO queue disappeared while refilling")?;
+                    if pending.saturating_add(2)>target_pending { break; }
+                    let (left,right)=frames[next_frame];
+                    if !self.device.send_iso_sdu(&mut self.host,handles[0],left) {
+                        return Err(format!("left ISO SDU enqueue failed at frame {next_frame}"));
+                    }
+                    if !self.device.send_iso_sdu(&mut self.host,handles[1],right) {
+                        return Err(format!("right ISO SDU enqueue failed at frame {next_frame}"));
+                    }
+                    next_frame+=1;
+                }
+
                 self.poll_iso_transport()?;
                 self.require_iso_links(handles,acls)?;
                 let tx=self.iso_tx_snapshot()?;
@@ -232,21 +241,21 @@ impl AttachedController {
                 let per_ear=tx.completed[0].min(tx.completed[1]);
                 while per_ear>=next_report {
                     println!(
-                        "[R5.3-C/DRAIN] completed={:?}/{:?} submitted={:?} controller_pending={} elapsed={}ms",
+                        "[R5.3-C/DRAIN] completed={:?}/{:?} submitted={:?} host+controller_pending={} queued_pairs={}/{} elapsed={}ms",
                         tx.completed,[frames.len() as u64;2],tx.submitted,
-                        self.device.iso_packets_pending().unwrap_or(usize::MAX),start.elapsed().as_millis()
+                        self.device.iso_packets_pending().unwrap_or(usize::MAX),next_frame,frames.len(),start.elapsed().as_millis()
                     );
                     next_report+=100;
                 }
                 let pending=self.device.iso_packets_pending().ok_or("ISO queue disappeared during drain")?;
-                if pending==0 { break; }
+                if next_frame==frames.len() && pending==0 { break; }
                 if last_progress.elapsed()>=PROGRESS_TIMEOUT {
                     return Err(format!(
-                        "ISO controller queue made no completion progress for {}ms: submitted={:?} completed={:?} pending={pending}",
-                        PROGRESS_TIMEOUT.as_millis(),tx.submitted,tx.completed
+                        "ISO controller queue made no completion progress for {}ms: queued_pairs={next_frame}/{} submitted={:?} completed={:?} pending={pending}",
+                        PROGRESS_TIMEOUT.as_millis(),frames.len(),tx.submitted,tx.completed
                     ));
                 }
-                self.wait_iso_activity(Duration::from_millis(50))?;
+                self.wait_iso_activity(POLL_SLICE)?;
             }
 
             self.require_iso_links(handles,acls)?;
@@ -254,10 +263,15 @@ impl AttachedController {
             tx.verify_complete(frames.len() as u64)?;
             let elapsed_ms=start.elapsed().as_millis() as u64;
             println!(
-                "[R5.3-C/DONE] controller-paced drain PASS: pairs={} elapsed={}ms peak_hci_pending={}",
+                "[R5.3-C/DONE] bounded queued transport PASS: pairs={} elapsed={}ms peak_hci_pending={}",
                 frames.len(),elapsed_ms,tx.peak_pending
             );
-            println!("[R5.3/TX-SYNC] skipped: pinned Bumble-RS U24 Time_Offset parser quirk");
+            // Pinned Bumble-RS has an exact parser bug here: Core defines the
+            // LE Read ISO TX Sync Time_Offset field as 24 bits, but this revision
+            // reads u32. BE200 returns the valid 12-byte payload, so the parser
+            // fails at offset 9 with only three bytes remaining. TX Sync is
+            // optional evidence and must not poison a valid stream/cleanup.
+            println!("[R5.3/TX-SYNC] skipped: pinned Bumble-RS parses 24-bit Time_Offset as u32");
             Ok(IsoStreamReport {
                 frame_pairs:frames.len() as u64,
                 elapsed_ms,
@@ -272,6 +286,7 @@ impl AttachedController {
         }
         result
     }
+
 }
 
 #[cfg(test)]
