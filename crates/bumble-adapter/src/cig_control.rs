@@ -12,7 +12,7 @@ use std::fmt;
 use std::time::Duration;
 
 use bumble_hci::{Command, ReturnParameters};
-use bumble_transport::{Error, Result as TransportResult};
+use bumble_transport::{CommandResponse, Error, Result as TransportResult};
 
 use crate::AttachedController;
 
@@ -101,7 +101,56 @@ pub fn parse_set_cig_response(
     Ok(CigAllocation { cig_id: expected_cig_id, cis })
 }
 
+/// R5.2-B resume gate: LE Remove CIG (0x2065) is idempotent *only at
+/// this dedicated no-ACL preflight boundary*. Unknown CIG (0x02) is an
+/// acceptable empty state. Any active-CIG disallowed (0x0C) is NOT safe.
+fn classify_preflight_remove_cig(
+    response: &CommandResponse,
+    cig_id: u8,
+) -> TransportResult<bool> {
+    match response {
+        CommandResponse::Complete {
+            return_parameters: ReturnParameters::LeRemoveCig {
+                status: 0,
+                cig_id: returned,
+            },
+            ..
+        } if *returned == cig_id => Ok(true),
+        CommandResponse::Complete {
+            return_parameters: ReturnParameters::Status { status: 0x02 },
+            ..
+        } => Ok(false),
+        other => Err(Error::Remote(format!(
+            "CIG {cig_id} preflight cannot prove inactive/absent CIG; LE Remove CIG returned {other:?}; refusing new CIS session"
+        ))),
+    }
+}
+
 impl AttachedController {
+    /// Reconcile only this app's CIG ID before any fresh bonded ACL exists.
+    /// Needed after an earlier probe left an inactive CIG allocated.
+    /// Does not issue HCI Reset or touch pairing/bond material.
+    pub fn reconcile_test_cig_pre_acl(&mut self, cig_id: u8) -> TransportResult<bool> {
+        if self.device.is_connected() {
+            return Err(Error::Remote(
+                "cannot reconcile a CIG after LE ACL connection establishment".into()
+            ));
+        }
+        let response = self.host.send_command(
+            Command::LeRemoveCig { cig_id },
+            CIG_COMMAND_TIMEOUT,
+        )?;
+        let removed = classify_preflight_remove_cig(&response, cig_id)?;
+        if removed {
+            println!(
+                "[R5.2/RECOVERY] removed leftover inactive CIG={cig_id} before ACL PASS"
+            );
+        } else {
+            println!("[R5.2/RECOVERY] CIG={cig_id} absent before ACL PASS");
+        }
+        Ok(removed)
+    }
+
     /// HCI LE Set CIG Parameters (0x2062); never HCI LE Create CIS.
     pub fn set_cig_parameters_unestablished(
         &mut self,
@@ -191,6 +240,39 @@ mod tests {
         parse_set_cig_response(
             &ReturnParameters::Raw { data: bytes.to_vec() }, 1, ids
         )
+    }
+
+    #[test]
+    fn preflight_cig_recovery_requires_confirmed_success_or_absence() {
+        let response_ok = CommandResponse::Complete {
+            num_hci_command_packets: 1,
+            return_parameters: ReturnParameters::LeRemoveCig {
+                status: 0, cig_id: 1,
+            },
+        };
+        assert_eq!(classify_preflight_remove_cig(&response_ok, 1).unwrap(), true);
+        assert!(classify_preflight_remove_cig(&response_ok, 2).is_err());
+
+        let response_missing = CommandResponse::Complete {
+            num_hci_command_packets: 1,
+            return_parameters: ReturnParameters::Status { status: 0x02 },
+        };
+        assert_eq!(classify_preflight_remove_cig(&response_missing, 1).unwrap(), false);
+
+        for status in [0x0C, 0x12] {
+            let response = CommandResponse::Complete {
+                num_hci_command_packets: 1,
+                return_parameters: ReturnParameters::Status { status },
+            };
+            assert!(classify_preflight_remove_cig(&response, 1).is_err());
+        }
+        assert!(classify_preflight_remove_cig(
+            &CommandResponse::Status {
+                status: 0,
+                num_hci_command_packets: 1,
+            },
+            1,
+        ).is_err());
     }
 
     #[test]
