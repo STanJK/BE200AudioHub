@@ -31,6 +31,10 @@ Not allowed:
    is now set. This Host feature is controller-local, not a bond mutation.
    Bluetooth requires this before any ACL exists. It survives during the
    controller session and may need re-enabling after a firmware cold boot.
+   **R5.2-B recovery**: issue HCI LE Remove CIG(1) once while no ACL exists,
+   accepting only Status=0 (removed an inactive leftover CIG with matching
+   CIG ID) or Status=0x02 (no CIG to remove). Any other status, particularly
+   0x0C (CIG still active), aborts safely before connecting the earbuds.
 2. Resolve both bonded peers, two encrypted ACLs and PACS/ASCS/CAS discovery.
 3. Prepare two Sink ASEs and install Control Point + ASE CCCDs.
 3. Both ASCS Config Codec: expect matched CP Success, Codec Configured
@@ -88,6 +92,8 @@ Expected success markers:
 [R5.2/HOST] pre-ACL CIS Host Support bit32=...
 [R5.2/HOST] CIS Host Support bit32 READBACK PASS
 [R5.2/HOST] READY: bit32_enabled=true ...
+[R5.2/RECOVERY] CIG=1 absent before ACL PASS
+  (or: removed leftover inactive CIG=1 before ACL PASS)
 [R4.2/CONFIG] left and right ... PASS
 [R5.2/CIG] HCI Set CIG PASS
 [R5.2/QOS] left ... QoSConfigured PASS
@@ -131,8 +137,25 @@ Enabling/Streaming after its CIS disconnects.
   allocated CIS handle failed. The other CIS may already be established.
 - **ASE readback differs after establishment**: link succeeded at HCI level,
   but ASCS server state is not proven; teardown still required.
+- **Historical second R5.2-B HIL: 2/2 CIS Established PASS, teardown
+  UNCONFIRMED**: Both earbuds autonomously reached Streaming (0x04);
+  controller reported 2M PHY, 63,210us C->P transport latency,
+  NSE=2/BN=1/FT=7/MaxPDU=100/ISO Interval=8.
+  Our CIS Disconnect incorrectly used command Reason=0x16, which the Core
+  HCI_Disconnect command *does not permit*. 0x16 is the **local Disconnection
+  Complete event Reason**, not a legal command Reason. BE200 returned
+  Invalid HCI Command Parameters (0x12) for both CIS. Because the CIS
+  remained active, both Release attempts timed out awaiting final Idle
+  notifications and Remove CIG returned Command Disallowed (0x0C).
+  Both ACLs subsequently disconnected with implicit CIS disconnection events,
+  but that did not prove CIG release. The next R5.2-B run uses HCI Disconnect
+  command Reason=0x13 (permitted by Core 7.1.6); local event Reason remains
+  0x16. A pre-ACL cleanup gate reconciles any inactive CIG 1 leftover from
+  the failed run.
 - **CIS Disconnect/Remove CIG fails**: do not claim PASS or start another HIL
   attempt until controller resources and both ASE states are inspected.
+  The pre-ACL recovery gate must prove that CIG 1 was absent or removed
+  before any new CIS creation.
 - **Spontaneous early remote streaming/disconnect**: expected possibility
   when no ISO data packets are sent. Log both HCI and ASE observations.
 
