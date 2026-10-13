@@ -24,8 +24,15 @@ Not allowed:
 
 ## State/command sequence
 
-1. Resolve both bonded peers, two encrypted ACLs and PACS/ASCS/CAS discovery.
-2. Prepare two Sink ASEs and install Control Point + ASE CCCDs.
+1. **Before any scan/ACL**: check CIS (Host Support) feature bit 32 from
+   the BE200 Local LE Features snapshot. If clear, send pinned Bumble-RS
+   `HCI_LE_Set_Host_Feature (0x2074, bit_number=32, bit_value=1)`, require
+   successful Command Complete, re-read Local LE Features and verify bit32
+   is now set. This Host feature is controller-local, not a bond mutation.
+   Bluetooth requires this before any ACL exists. It survives during the
+   controller session and may need re-enabling after a firmware cold boot.
+2. Resolve both bonded peers, two encrypted ACLs and PACS/ASCS/CAS discovery.
+3. Prepare two Sink ASEs and install Control Point + ASE CCCDs.
 3. Both ASCS Config Codec: expect matched CP Success, Codec Configured
    notification and independent readback.
 4. HCI LE Set CIG Parameters: BE200 returns one CIG with 2 ordered allocated
@@ -78,7 +85,10 @@ radio links; it requires a **new, distinct confirmation flag**.
 Expected success markers:
 
 ```text
-[R5.2/CONFIG] ... (R4.2/CONFIG left and right)
+[R5.2/HOST] pre-ACL CIS Host Support bit32=...
+[R5.2/HOST] CIS Host Support bit32 READBACK PASS
+[R5.2/HOST] READY: bit32_enabled=true ...
+[R4.2/CONFIG] left and right ... PASS
 [R5.2/CIG] HCI Set CIG PASS
 [R5.2/QOS] left ... QoSConfigured PASS
 [R5.2/QOS] right ... QoSConfigured PASS
@@ -103,6 +113,16 @@ Enabling/Streaming after its CIS disconnects.
 
 ## Diagnostic branches
 
+- **Historical 0x0C Command Disallowed in first R5.2-B HIL**: Both Codec,
+  CIG, Config QoS, Enable and rollback passed, but HCI LE Create CIS returned
+  0x0C before asynchronous establishment. Comparison with the Bluetooth Core
+  spec and Linux `net/bluetooth/hci_sync.c` found our
+  `initialize_existing_operational` did not configure the Controller's
+  CIS (Host Support) feature bit32, unlike Linux's
+  `hci_le_set_host_feature_sync`. The new pre-ACL gate tests this hypothesis.
+  If the feature readback is already **true** and Create CIS still returns
+  0x0C, investigate other command-disallowed conditions rather than assuming
+  the fix worked. No conclusion until real HIL passes.
 - **HCI Create CIS Command Status nonzero**: this is an explicit controller
   rejection. Preserve HCI status, do not assume either CIS established.
 - **Command Status 0, one or both LE CIS Established events missing**:
@@ -117,6 +137,8 @@ Enabling/Streaming after its CIS disconnects.
   when no ISO data packets are sent. Log both HCI and ASE observations.
 
 ## Next milestone
+
+References: [Linux Host Feature bit32 setup](https://codebrowser.dev/linux/linux/net/bluetooth/hci_sync.c.html) and [Bluetooth Core HCI spec](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-60/out/en/host-controller-interface/host-controller-interface-functional-specification.html).
 
 R5.3 builds only after 2/2 CIS Established plus cleanup HIL passes:
 prepare ISO Data Path in the BE200 controller, implement LC3 encode and
