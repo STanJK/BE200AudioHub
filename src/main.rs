@@ -41,6 +41,9 @@ fn usage() -> &'static str {
        be200hub r5 qos-plan --seconds <1..30> --name <DEVICE_NAME> --confirm-ascs-write\n\
        be200hub r5 config-qos --seconds <1..30> --name <DEVICE_NAME> --confirm-cig-qos-write\n\
        be200hub r5 establish-cis --seconds <1..30> --name <DEVICE_NAME> --confirm-cis-create\n\
+       be200hub r5 iso-path-probe --seconds <1..30> --name <DEVICE_NAME> --confirm-iso-path\n\
+       be200hub r5 lc3-self-test\n\
+       be200hub r5 first-sound --seconds <1..30> --name <DEVICE_NAME> --play-seconds <1..30> --confirm-first-sound\n\
        be200hub firmware inspect <SFI_PATH> [DDC_PATH]\n\
        be200hub firmware plan --sfi <PATH> --ddc <PATH>\n\
        be200hub firmware preflight --sfi <PATH> --ddc <PATH>\n\
@@ -166,7 +169,64 @@ fn parse_r5_establish_cis_invocation(args: &[String]) -> Result<Option<(u16, &st
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum R53Invocation<'a> {
+    CodecSelfTest,
+    IsoPaths { seconds: u16, name: &'a str },
+    FirstSound { seconds: u16, name: &'a str, play_seconds: u16 },
+}
+
+/// Distinct consent flags and full argument validation BEFORE any USB bootstrap.
+fn parse_r53_invocation(args: &[String]) -> Result<Option<R53Invocation<'_>>> {
+    let valid_name = |name: &str| -> Result<()> {
+        if name.trim().is_empty() { Err(AppError::Usage("--name requires a nonempty device name".into())) } else { Ok(()) }
+    };
+    match args {
+        [r5, command] if r5 == "r5" && command == "lc3-self-test" => Ok(Some(R53Invocation::CodecSelfTest)),
+        [r5, command, seconds_flag, seconds, name_flag, name, confirm]
+            if r5 == "r5" && command == "iso-path-probe" && seconds_flag == "--seconds"
+                && name_flag == "--name" && confirm == "--confirm-iso-path" => {
+            valid_name(name)?;
+            Ok(Some(R53Invocation::IsoPaths { seconds: audio_set::parse_seconds(seconds)?, name }))
+        }
+        [r5, command, seconds_flag, seconds, name_flag, name, play_flag, play, confirm]
+            if r5 == "r5" && command == "first-sound" && seconds_flag == "--seconds"
+                && name_flag == "--name" && play_flag == "--play-seconds" && confirm == "--confirm-first-sound" => {
+            valid_name(name)?;
+            let play_seconds: u16 = play.parse().map_err(|_| AppError::Usage("--play-seconds must be an integer (1..=30)".into()))?;
+            audio_bridge::first_sound::validate_play_seconds(play_seconds).map_err(AppError::Usage)?;
+            Ok(Some(R53Invocation::FirstSound {seconds:audio_set::parse_seconds(seconds)?,name,play_seconds}))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn run_codec_self_test() -> Result<()> {
+    let report = audio_bridge::first_sound::first_sound_codec_self_test().map_err(AppError::Protocol)?;
+    println!("[R5.3-B/LC3] offline encode/decode PASS: frames={} left_RMS={:.1} right_RMS={:.1} tone_power_ratios={:.1}/{:.1}; no USB/bond access",
+        report.stereo_frames, report.left_rms, report.right_rms, report.left_440_over_880, report.right_880_over_440);
+    Ok(())
+}
+
 fn run(args: &[String]) -> Result<()> {
+    if let Some(invocation) = parse_r53_invocation(args)? {
+        return match invocation {
+            R53Invocation::CodecSelfTest => run_codec_self_test(),
+            R53Invocation::IsoPaths { seconds, name } => {
+                let _guard = bumble_adapter::ProbeGuard::install().map_err(AppError::Protocol)?;
+                run_operational(|| audio_set::iso_paths(seconds, name))
+            }
+            R53Invocation::FirstSound { seconds, name, play_seconds } => {
+                let _guard = bumble_adapter::ProbeGuard::install().map_err(AppError::Protocol)?;
+                println!("[R5.3-B/PREP] offline LC3 self-test and {}s bounded stereo pre-encode before hardware bootstrap", play_seconds);
+                run_codec_self_test()?;
+                let tone = audio_bridge::first_sound::prepare_first_sound(play_seconds).map_err(AppError::Protocol)?;
+                println!("[R5.3-B/PREP] READY: {} stereo frame pairs, 100B/ear/10ms", tone.frames().len());
+                bumble_adapter::ProbeGuard::check_cancelled().map_err(AppError::Protocol)?;
+                run_operational(|| audio_set::first_sound(seconds, name, &tone))
+            }
+        };
+    }
     if let Some((seconds, name)) = parse_r5_establish_cis_invocation(args)? {
         return run_operational(|| audio_set::establish_cis(seconds, name));
     }
@@ -454,5 +514,28 @@ mod r4_cli_tests {
         command.push("--confirm-ascs-write".into());
         command[3] = "31".into();
         assert!(parse_r5_qos_invocation(&command).is_err());
+    }
+}
+
+#[cfg(test)]
+mod r53_cli_tests {
+    use super::*;
+    fn args(words: &[&str]) -> Vec<String> { words.iter().map(|s|s.to_string()).collect() }
+    #[test]
+    fn first_sound_requires_its_own_consent_and_valid_duration_before_bootstrap() {
+        let mut a=args(&["r5","first-sound","--seconds","8","--name","Buds","--play-seconds","8","--confirm-first-sound"]);
+        assert_eq!(parse_r53_invocation(&a).unwrap(),Some(R53Invocation::FirstSound {seconds:8,name:"Buds",play_seconds:8}));
+        a[8]="--confirm-cis-create".into(); assert_eq!(parse_r53_invocation(&a).unwrap(),None);
+        a[8]="--confirm-first-sound".into();
+        for bad in ["0","31","-1","abc"] { a[7]=bad.into(); assert!(parse_r53_invocation(&a).is_err()); }
+        a[7]="8".into(); a[5]=" ".into(); assert!(parse_r53_invocation(&a).is_err());
+    }
+    #[test]
+    fn paths_probe_is_separate_and_codec_test_is_hardware_free() {
+        assert_eq!(parse_r53_invocation(&args(&["r5","lc3-self-test"])).unwrap(),Some(R53Invocation::CodecSelfTest));
+        let mut a=args(&["r5","iso-path-probe","--seconds","8","--name","Buds","--confirm-iso-path"]);
+        assert_eq!(parse_r53_invocation(&a).unwrap(),Some(R53Invocation::IsoPaths {seconds:8,name:"Buds"}));
+        a[6]="--confirm-first-sound".into(); assert_eq!(parse_r53_invocation(&a).unwrap(),None);
+        a.push("extra".into()); assert_eq!(parse_r53_invocation(&a).unwrap(),None);
     }
 }

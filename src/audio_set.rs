@@ -4,7 +4,7 @@ use crate::{
 };
 use bap_client::{
     configure_and_release, configure_qos_and_release, establish_dual_cis_and_release,
-    plan_first_sound,
+    plan_first_sound, run_dual_iso_probe_and_release,
     plan_first_sound_qos, AudioSetSnapshot, CodecConfigScope, CodecConfigurationPlan,
     CodecConfiguredSetSnapshot, ConnectedAudioMember, DualCisProbeSnapshot,
     QosConfiguredSetSnapshot, StereoQosPlan,
@@ -63,6 +63,22 @@ enum AudioSetAction {
     QosPlan,
     ConfigQos,
     EstablishCis,
+    IsoPaths,
+    FirstSound,
+}
+
+impl AudioSetAction {
+    fn creates_cis(self) -> bool {
+        matches!(self, Self::EstablishCis | Self::IsoPaths | Self::FirstSound)
+    }
+}
+
+pub fn iso_paths(seconds: u16, wanted_name: &str) -> Result<()> {
+    inspect_impl(seconds, wanted_name, AudioSetAction::IsoPaths)
+}
+
+pub fn first_sound(seconds: u16, wanted_name: &str, tone: &audio_bridge::first_sound::PreparedStereoTone) -> Result<()> {
+    inspect_with_audio(seconds, wanted_name, AudioSetAction::FirstSound, Some(tone))
 }
 
 pub fn inspect(seconds: u16, wanted_name: &str) -> Result<()> {
@@ -106,6 +122,16 @@ pub fn establish_cis(seconds: u16, wanted_name: &str) -> Result<()> {
 }
 
 fn inspect_impl(seconds: u16, wanted_name: &str, action: AudioSetAction) -> Result<()> {
+    inspect_with_audio(seconds, wanted_name, action, None)
+}
+
+fn inspect_with_audio(
+    seconds: u16, wanted_name: &str, action: AudioSetAction,
+    tone: Option<&audio_bridge::first_sound::PreparedStereoTone>,
+) -> Result<()> {
+    if matches!(action, AudioSetAction::FirstSound) && tone.is_none() {
+        return Err(AppError::Protocol("First Sound requires offline-prepared LC3 frames".into()));
+    }
     if wanted_name.trim().is_empty() {
         return Err(AppError::Usage(
             "--name requires a nonempty device name".into(),
@@ -121,11 +147,19 @@ fn inspect_impl(seconds: u16, wanted_name: &str, action: AudioSetAction) -> Resu
             AudioSetAction::QosPlan => "R5.1 QoS/CIG planner (R4.2 codec-write probe + dry run)",
             AudioSetAction::ConfigQos => "R5.2-A HCI CIG allocation + dual ASCS Config QoS transaction",
             AudioSetAction::EstablishCis => "R5.2-B ASCS Enable + Dual CIS Establishment + teardown",
+            AudioSetAction::IsoPaths => "R5.3-A dual ISO input-path setup/remove probe (no audio)",
+            AudioSetAction::FirstSound => "R5.3 A/B/C bounded dual-mono LC3 First Sound probe",
         }
     );
     println!("Target name: {wanted_name:?}");
     println!("Path: one scan -> resolve all members -> identity/FAL dual bonded ACL -> PACS/ASCS/CAS discovery.");
-    if matches!(action, AudioSetAction::EstablishCis) {
+    if matches!(action, AudioSetAction::IsoPaths | AudioSetAction::FirstSound) {
+        println!("Safety: explicit transient ASCS/CIG/CIS/ISO writes; no SMP, no bond mutation, no Source ASE or Receiver Start Ready.");
+        println!("Cleanup: ISO drain/remove -> CIS disconnect -> ASE Disable/Release/Idle -> Remove CIG -> ACL/privacy cleanup.");
+        if matches!(action, AudioSetAction::FirstSound) {
+            println!("Audio: left 440Hz/right 880Hz low-level test tones; HCI completion does NOT prove acoustic output.");
+        } else { println!("No LC3 or ISO audio packets will be sent."); }
+    } else if matches!(action, AudioSetAction::EstablishCis) {
         println!("Safety: ASCS Codec/QoS/Enable/Disable/Release and HCI CIG/Create CIS/Disconnect writes ENABLED.");
         println!("No SMP, bond mutation, Receiver Start Ready, ISO Data Path or audio packets. CIS disconnect, ASE Idle and CIG removal required.");
     } else if matches!(action, AudioSetAction::ConfigQos) {
@@ -145,7 +179,7 @@ fn inspect_impl(seconds: u16, wanted_name: &str, action: AudioSetAction) -> Resu
     // Cached HCI Local Features + Supported Commands + LE Buffer Size V2.
     // This does not submit any new HCI commands.
     let controller_iso = attached.iso_controller_capabilities();
-    if matches!(action, AudioSetAction::QosPlan | AudioSetAction::ConfigQos | AudioSetAction::EstablishCis) {
+    if matches!(action, AudioSetAction::QosPlan | AudioSetAction::ConfigQos | AudioSetAction::EstablishCis | AudioSetAction::IsoPaths | AudioSetAction::FirstSound) {
         println!(
             "[R5/ISO] controller capability snapshot: CIS_Central={} 2M={} SetCig={} CreateCis={} RemoveCig={} SetupIsoPath={} ISO={}B x {}",
             controller_iso.cis_central, controller_iso.le_2m_phy,
@@ -202,7 +236,7 @@ fn inspect_impl(seconds: u16, wanted_name: &str, action: AudioSetAction) -> Resu
     // Core 5.2+ requires CIS Host Support (feature bit32) set *before*
     // establishing any LE ACL. Only R5.2-B and later ISO probes request
     // this controller-local Host capability; R3/R4/R5.2-A are unchanged.
-    if matches!(action, AudioSetAction::EstablishCis) {
+    if action.creates_cis() {
         let report = attached.ensure_cis_host_feature_pre_acl()
             .map_err(|error| AppError::Protocol(format!(
                 "R5.2-B controller Host Feature preflight failed: {error}"
@@ -364,7 +398,7 @@ fn inspect_impl(seconds: u16, wanted_name: &str, action: AudioSetAction) -> Resu
                 AppError::Protocol(format!("R4.1 codec planning failed: {error}"))
             })?)
         };
-        if matches!(action, AudioSetAction::QosPlan | AudioSetAction::ConfigQos | AudioSetAction::EstablishCis) {
+        if matches!(action, AudioSetAction::QosPlan | AudioSetAction::ConfigQos | AudioSetAction::EstablishCis | AudioSetAction::IsoPaths | AudioSetAction::FirstSound) {
             let max_sdu = plan.as_ref().expect("non-inspect action has codec plan")
                 .stream.octets_per_codec_frame;
             // Refuse unsupported controllers BEFORE writing Config Codec.
@@ -400,6 +434,10 @@ fn inspect_impl(seconds: u16, wanted_name: &str, action: AudioSetAction) -> Resu
             _ => None,
         };
         let cis_established = match (action, plan.as_ref()) {
+            (AudioSetAction::IsoPaths | AudioSetAction::FirstSound, Some(codec)) => {
+                Some(run_dual_iso_probe_and_release(&mut attached, codec, controller_iso, tone)
+                    .map_err(|error| AppError::Protocol(format!("R5.3 ISO transaction failed: {error}")))?)
+            }
             (AudioSetAction::EstablishCis, Some(codec)) => {
                 Some(establish_dual_cis_and_release(&mut attached, codec, controller_iso)
                     .map_err(|error| AppError::Protocol(format!("R5.2-B CIS transaction failed: {error}")))?)
@@ -458,7 +496,18 @@ fn inspect_impl(seconds: u16, wanted_name: &str, action: AudioSetAction) -> Resu
         print_codec_plan(&plan);
         if let Some(cis) = cis_established {
             print_cis_probe(&cis);
-            println!("R5.2-B DUAL CIS PASS: 2/2 LE CIS Established events, both ASEs Idle, both CIS disconnected, CIG removed, ACLs disconnected, bond unchanged; no ISO Data Path/audio.");
+            if let Some(iso) = &cis.iso {
+                println!("[R5.3/RESULT] input_paths={}/2 removed={}/2 both_ases_streaming={}",
+                    iso.input_paths_configured, iso.input_paths_removed, iso.both_ases_streaming);
+                if let Some(stream) = &iso.stream {
+                    println!("[R5.3/RESULT] transport probe PASS: pairs={} completed={:?} peak_pending={} elapsed={}ms max_late={}us",
+                        stream.frame_pairs,stream.tx.completed,stream.tx.peak_pending,stream.elapsed_ms,stream.max_lateness_us);
+                    println!("FIRST SOUND LISTENING RESULT: USER VERIFICATION REQUIRED (left 440Hz, right 880Hz). HCI completions are not audibility or RF delivery proof.");
+                } else { println!("R5.3-A ISO DATA PATH PASS: 2/2 Setup and 2/2 Remove verified; zero audio packets requested."); }
+                println!("R5.3 CLEANUP PASS: ASEs Idle, CIS/ACL disconnected, CIG removed, persistent bond fingerprint unchanged.");
+            } else {
+                println!("R5.2-B DUAL CIS PASS: 2/2 LE CIS Established events, both ASEs Idle, both CIS disconnected, CIG removed, ACLs disconnected, bond unchanged; no ISO Data Path/audio.");
+            }
         } else if let Some(qos_configured) = qos_configured {
             print_qos_configured(&qos_configured);
             println!("R5.2-A CONFIG QOS PASS: both ASEs CodecConfigured -> QoSConfigured with CP+notify+readback; both released Idle, CIG removed, ACLs disconnected, no CIS established, bond unchanged.");
@@ -734,7 +783,10 @@ fn print_cis_probe(snapshot: &DualCisProbeSnapshot) {
             link.iso_interval
         );
     }
-    println!("  CIS and ACL handles are no longer valid after teardown. No ISO payload transmitted.");
+    println!("  CIS and ACL handles are no longer valid after teardown.");
+    if snapshot.iso.as_ref().and_then(|iso| iso.stream.as_ref()).is_none() {
+        println!("  No ISO audio payload transmitted.");
+    }
 }
 
 fn print_qos_configured(snapshot: &QosConfiguredSetSnapshot) {

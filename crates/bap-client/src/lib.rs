@@ -11,7 +11,7 @@ mod discovery;
 mod ase_read;
 mod snapshot;
 
-pub use cis_session::{establish_dual_cis_and_release, DualCisProbeSnapshot, EnabledMember};
+pub use cis_session::{establish_dual_cis_and_release, run_dual_iso_probe_and_release, DualCisProbeSnapshot, EnabledMember, IsoProbeSnapshot};
 pub use codec_config::{
     configure_and_release, configure_qos_and_release,
     CodecConfigScope, CodecConfiguredMember, CodecConfiguredSetSnapshot,

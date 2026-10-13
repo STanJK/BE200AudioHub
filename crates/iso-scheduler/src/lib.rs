@@ -34,3 +34,5 @@ mod tests {
         assert_eq!(config.frame_quantum(), Some(480));
     }
 }
+
+pub mod first_sound;

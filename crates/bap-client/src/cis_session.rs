@@ -1,13 +1,14 @@
-//! R5.2-B: guarded, short-lived two-ear LE CIS establishment probe.
+//! Shared guarded two-ear CIS lifecycle for R5.2-B and the opt-in R5.3 probe.
 //!
-//! Reuses R4.2/R5.2-A ASCS and CIG paths. The only new protocol operations
-//! are ASCS Enable/Disable and HCI LE Create CIS/Disconnect. No Receiver Start
-//! Ready is sent (both selected ASEs are Audio Sink), no ISO Data Path is
-//! installed and no LC3/ISO packets are transmitted.
+//! R5.2-B still installs no ISO paths and transmits no audio. R5.3 additionally
+//! verifies input paths and optionally sends pre-encoded dual-mono LC3, then
+//! removes the paths before the existing CIS/ASE/CIG rollback. Neither path
+//! sends Receiver Start Ready: both selected ASEs are Audio Sink.
 
 use std::time::{Duration, Instant};
 
-use bumble_adapter::{AttachedController, CigAllocation, EstablishedCis, IsoControllerCapabilities};
+use bumble_adapter::{AttachedController, CigAllocation, EstablishedCis, IsoControllerCapabilities, IsoStreamReport, ProbeGuard};
+use audio_bridge::first_sound::PreparedStereoTone;
 use bumble_profiles::ascs::{
     AseMetadataParameters, AseOperation, AseState, AseStatus, AseStatusDetails,
 };
@@ -49,6 +50,22 @@ pub struct DualCisProbeSnapshot {
     pub all_ases_idle: bool,
     pub all_cis_disconnected: bool,
     pub cig_removed: bool,
+    /// Present only for the opt-in R5.3 path. R5.2-B remains control-only.
+    pub iso: Option<IsoProbeSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IsoProbeSnapshot {
+    pub input_paths_configured: usize,
+    pub input_paths_removed: usize,
+    pub both_ases_streaming: bool,
+    pub stream: Option<IsoStreamReport>,
+}
+
+#[derive(Clone, Copy)]
+enum DataProbe<'a> { None, PathsOnly, Tone(&'a PreparedStereoTone) }
+impl DataProbe<'_> {
+    fn enabled(self) -> bool { !matches!(self, Self::None) }
 }
 
 fn media_metadata(context: u16) -> Result<Metadata, String> {
@@ -168,6 +185,33 @@ fn verify_post_cis_ase_status(
     }
 }
 
+fn wait_for_streaming(
+    controller: &mut AttachedController, prepared: &PreparedSink<'_>, cig_id: u8, cis_id: u8,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        ProbeGuard::check_cancelled()?;
+        let status = read_sink_status(controller, prepared)?;
+        if status.ase_id != prepared.sink.ase_id {
+            return Err("R5.3 remote ASE identity changed".into());
+        }
+        match &status.details {
+            AseStatusDetails::Metadata { cig_id: actual_cig, cis_id: actual_cis, .. }
+                if *actual_cig == cig_id && *actual_cis == cis_id => {},
+            other => return Err(format!("R5.3 remote ASE metadata mismatch: {other:?}")),
+        }
+        if status.state == AseState::STREAMING {
+            println!("[R5.3/ASE] {} ASE={} Streaming readback PASS", prepared.sink.side.as_str(), status.ase_id);
+            return Ok(());
+        }
+        if status.state != AseState::ENABLING || Instant::now() >= deadline {
+            return Err(format!("R5.3 {} ASE={} not Streaming: state=0x{:02X}; no Receiver Start Ready is sent to Sink ASEs",
+                prepared.sink.side.as_str(),status.ase_id,status.state.0));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Cleanup after Create CIS, including partial/uncertain establishment:
 /// (a) caller disconnects any established CIS,
 /// (b) sink Disable if still Enabling/Streaming,
@@ -238,15 +282,47 @@ pub fn establish_dual_cis_and_release(
     codec: &CodecConfigurationPlan,
     capabilities: IsoControllerCapabilities,
 ) -> Result<DualCisProbeSnapshot, String> {
+    run_dual_cis_transaction(controller, codec, capabilities, DataProbe::None)
+}
+
+/// R5.3-A when tone is None; the complete A/B/C probe when tone is prepared.
+/// Shares the proven R5.2-B transaction and its rollback, not a second lifecycle.
+pub fn run_dual_iso_probe_and_release(
+    controller: &mut AttachedController,
+    codec: &CodecConfigurationPlan,
+    capabilities: IsoControllerCapabilities,
+    tone: Option<&PreparedStereoTone>,
+) -> Result<DualCisProbeSnapshot, String> {
+    run_dual_cis_transaction(controller, codec, capabilities,
+        tone.map_or(DataProbe::PathsOnly, DataProbe::Tone))
+}
+
+fn run_dual_cis_transaction(
+    controller: &mut AttachedController,
+    codec: &CodecConfigurationPlan,
+    capabilities: IsoControllerCapabilities,
+    probe: DataProbe<'_>,
+) -> Result<DualCisProbeSnapshot, String> {
     if codec.left.acl_handle == codec.right.acl_handle {
         return Err("R5.2-B requires distinct encrypted left/right ACLs".into());
     }
     capabilities.validate_for_unfragmented_cis(codec.stream.octets_per_codec_frame)?;
+    if probe.enabled() {
+        if codec.stream.sample_rate_hz != 48_000 || codec.stream.frame_duration_us != 10_000
+            || codec.stream.octets_per_codec_frame != 100
+            || codec.stream.topology != device_policy::StreamTopology::StereoDualMonoAse
+        { return Err("R5.3 requires the verified 48kHz/10ms/100B dual-mono codec plan".into()); }
+        controller.require_iso_remove_support()?;
+        ProbeGuard::check_cancelled()?;
+    }
     let prepared = vec![
         prepare_sink(controller, &codec.left)?,
         prepare_sink(controller, &codec.right)?,
     ];
-    println!("[R5.2-B/TXN] Codec -> CIG -> QoS -> Enable -> Create CIS -> Disconnect -> Disable -> Release -> Remove CIG");
+    println!("[CIS/TXN] Codec -> CIG -> QoS -> Enable -> Create CIS -> optional ISO probe -> Disconnect -> Disable -> Release -> Remove CIG");
+    if probe.enabled() {
+        println!("[R5.3/TXN] ISO: Setup Input Paths -> optional bounded LC3 -> Drain -> Remove Input Paths (before CIS teardown)");
+    }
 
     let mut attempted = 0usize;
     let mut cig_may_exist = false;
@@ -256,9 +332,17 @@ pub fn establish_dual_cis_and_release(
     let mut qos_members = Vec::with_capacity(2);
     let mut enabled = Vec::with_capacity(2);
     let mut established = Vec::with_capacity(2);
+    let mut paths_may_exist = Vec::<u16>::new();
+    let mut paths_configured = 0usize;
+    let mut paths_removed = 0usize;
+    let mut stream_attempted = false;
+    let mut stream_report = None;
+    let mut both_streaming = false;
+    let mut stereo_handles = None;
 
     let stage = (|| -> Result<(), String> {
         for sink in &prepared {
+            if probe.enabled() { ProbeGuard::check_cancelled()?; }
             attempted += 1;
             codec_members.push(configure_sink(controller, sink)?);
         }
@@ -313,10 +397,52 @@ pub fn establish_dual_cis_and_release(
         );
         verify_post_cis_ase_status(controller, &prepared[0], allocated.cig_id, LEFT_CIS_ID)?;
         verify_post_cis_ase_status(controller, &prepared[1], allocated.cig_id, RIGHT_CIS_ID)?;
+        if probe.enabled() {
+            let handle_for = |id| allocated.cis.iter().find(|cis| cis.cis_id == id)
+                .map(|cis| cis.connection_handle).ok_or_else(|| format!("allocated CIG omitted CIS {id}"));
+            let handles = [handle_for(LEFT_CIS_ID)?, handle_for(RIGHT_CIS_ID)?];
+            stereo_handles = Some(handles);
+            for handle in handles {
+                ProbeGuard::check_cancelled()?;
+                match controller.setup_iso_input_path(handle) {
+                    Ok(()) => { paths_may_exist.push(handle); paths_configured += 1; }
+                    Err(error) => {
+                        if error.may_have_configured { paths_may_exist.push(handle); }
+                        return Err(format!("R5.3-A ISO Setup failed: {error}"));
+                    }
+                }
+            }
+            if let DataProbe::Tone(tone) = probe {
+                wait_for_streaming(controller, &prepared[0], allocated.cig_id, LEFT_CIS_ID)?;
+                wait_for_streaming(controller, &prepared[1], allocated.cig_id, RIGHT_CIS_ID)?;
+                both_streaming = true;
+                let frames = tone.frames().iter().map(|f| (&f.left[..], &f.right[..])).collect::<Vec<_>>();
+                println!("[R5.3-C/START] {}s / {} pairs; left 440Hz right 880Hz, low-level tone; no Windows audio capture", tone.play_seconds(), frames.len());
+                stream_attempted = true;
+                stream_report = Some(controller.transmit_stereo_iso(handles,
+                    [codec.left.acl_handle, codec.right.acl_handle], &frames)?);
+                // A live CIS alone is not proof the remote ASE kept Streaming.
+                wait_for_streaming(controller, &prepared[0], allocated.cig_id, LEFT_CIS_ID)?;
+                wait_for_streaming(controller, &prepared[1], allocated.cig_id, RIGHT_CIS_ID)?;
+            }
+        }
         Ok(())
     })();
 
     let mut cleanup_errors = Vec::new();
+    if stream_attempted {
+        if let Some(handles) = stereo_handles {
+            if let Err(error) = controller.drain_iso_output(handles) {
+                cleanup_errors.push(format!("ISO drain before teardown UNCONFIRMED: {error}"));
+            }
+        }
+    }
+    for &handle in paths_may_exist.iter().rev() {
+        match controller.remove_iso_input_path(handle) {
+            Ok(()) => paths_removed += 1,
+            Err(error) => cleanup_errors.push(format!("ISO input path Remove UNCONFIRMED: {error}")),
+        }
+    }
     if cis_create_attempted {
         if let Some(ref allocated) = allocation {
             if let Err(error) = controller.disconnect_established_cis(
@@ -341,17 +467,17 @@ pub fn establish_dual_cis_and_release(
     }
     if let Err(error) = stage {
         return Err(if cleanup_errors.is_empty() {
-            format!("R5.2-B transaction failed, rollback confirmed: {error}")
+            format!("CIS/ISO transaction failed, rollback confirmed: {error}")
         } else {
             format!(
-                "R5.2-B transaction failed: {error}; cleanup UNCONFIRMED: {}",
+                "CIS/ISO transaction failed: {error}; cleanup UNCONFIRMED: {}",
                 cleanup_errors.join("; ")
             )
         });
     }
     if !cleanup_errors.is_empty() {
         return Err(format!(
-            "R5.2-B established CIS, but cleanup UNCONFIRMED: {}",
+            "CIS/ISO stage completed, but cleanup UNCONFIRMED: {}",
             cleanup_errors.join("; ")
         ));
     }
@@ -367,6 +493,12 @@ pub fn establish_dual_cis_and_release(
         all_ases_idle: true,
         all_cis_disconnected: true,
         cig_removed: true,
+        iso: probe.enabled().then_some(IsoProbeSnapshot {
+            input_paths_configured: paths_configured,
+            input_paths_removed: paths_removed,
+            both_ases_streaming: both_streaming,
+            stream: stream_report,
+        }),
     })
 }
 

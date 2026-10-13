@@ -22,6 +22,9 @@ mod cis_control;
 mod cis_host_feature;
 mod init;
 mod iso_capabilities;
+mod iso_audit;
+mod iso_io;
+mod probe_guard;
 mod privacy;
 mod scan;
 mod security;
@@ -41,6 +44,9 @@ pub use connection_manager::LeConnectionManager;
 pub use csis::{rsi_matches_sirk, CsisMemberReport};
 pub use gatt_session::{AttValueEvent, LeAclState};
 pub use iso_capabilities::IsoControllerCapabilities;
+pub use iso_audit::IsoTxStats;
+pub use iso_io::{IsoPathFailure, IsoStreamReport};
+pub use probe_guard::ProbeGuard;
 pub use init::{
     attach_be200_existing_operational, attach_be200_existing_operational_raw_trace,
     initialize_existing_operational, AttachReport, AttachedController,

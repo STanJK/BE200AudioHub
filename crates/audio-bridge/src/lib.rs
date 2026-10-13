@@ -26,3 +26,5 @@ pub const RELAY_PCM_FORMAT: PcmFormat = PcmFormat {
 pub fn validate_plan_input(plan: &StreamPlan) -> bool {
     plan.sample_rate_hz == RELAY_SAMPLE_RATE_HZ
 }
+
+pub mod first_sound;

@@ -81,3 +81,10 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/HARDWARE.md](docs/HARDWA
 ## Validation
 
 The maintainer's Windows machine is the hardware test environment. A GitHub commit does **not** imply that a Windows runtime test or BE200 USB enumeration has been performed. The initial Cargo.lock should be generated and committed after the first local build.
+
+
+## R5.3 First Sound（本地候选；未编译 / 未 HIL）
+
+新增 `r5 first-sound`，一次串联 ISO Data Path、离线预编码 LC3 和双 CIS 有界发送。
+它不改变 R5.2-B 的已验收状态，也不把 HCI completion 当成可听发声。
+操作、诊断入口与验证限制见 [R5.3 说明](docs/r5-first-sound.md)。

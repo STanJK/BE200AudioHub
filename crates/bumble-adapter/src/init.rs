@@ -30,6 +30,7 @@ pub struct AttachedController {
     pub(crate) host: ExternalHost,
     pub(crate) device: Device,
     pub(crate) info: ExternalControllerInfo,
+    pub(crate) iso_audit: crate::iso_audit::SharedIsoAudit,
 }
 
 impl AttachedController {
@@ -102,10 +103,12 @@ fn attach_be200_existing_operational_impl(
         transport
     };
 
+    let iso_audit = std::sync::Arc::new(std::sync::Mutex::new(crate::iso_audit::IsoAudit::default()));
+    let transport = crate::iso_audit::wrap_transport(transport, iso_audit.clone());
     let mut host = ExternalHost::new(transport);
     let mut device = Device::new(0);
     let info = initialize_existing_operational(&mut host, &mut device, timeout)?;
-    Ok(AttachedController { host, device, info })
+    Ok(AttachedController { host, device, info, iso_audit })
 }
 
 

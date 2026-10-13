@@ -18,3 +18,4 @@ bumble-smp = { git = "https://github.com/chaitanyarahalkar/bumble-rs", rev = "bb
 rusb = { version = "0.9", features = ["vendored"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+iso-scheduler = { path = "../iso-scheduler" }
