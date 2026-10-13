@@ -199,6 +199,20 @@ fn inspect_impl(seconds: u16, wanted_name: &str, action: AudioSetAction) -> Resu
         set.members.len(), expected_size, resolver_count
     );
 
+    // Core 5.2+ requires CIS Host Support (feature bit32) set *before*
+    // establishing any LE ACL. Only R5.2-B and later ISO probes request
+    // this controller-local Host capability; R3/R4/R5.2-A are unchanged.
+    if matches!(action, AudioSetAction::EstablishCis) {
+        let report = attached.ensure_cis_host_feature_pre_acl()
+            .map_err(|error| AppError::Protocol(format!(
+                "R5.2-B controller Host Feature preflight failed: {error}"
+            )))?;
+        println!(
+            "[R5.2/HOST] READY: bit32_enabled={} wrote_host_feature={}",
+            report.enabled_after, report.set_command_sent
+        );
+    }
+
     println!("Discovery scan: resolving all current member addresses in one {seconds}s window...");
     let scan = attached
         .scan_passive_extended(seconds)
