@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
 
 use bumble_hci::{
@@ -17,6 +17,10 @@ use rusb::{
 const BE200_VID: u16 = 0x8087;
 const BE200_PID: u16 = 0x0036;
 const EVENT_READ_TIMEOUT: Duration = Duration::from_millis(10);
+// During ISO TX, Number Of Completed Packets is the inbound traffic that
+// advances controller credits. Keep interrupt-IN tight and suspend idle ACL
+// bulk-IN polling until a non-ISO host packet returns us to control-plane mode.
+const ISO_EVENT_READ_TIMEOUT: Duration = Duration::from_millis(1);
 // Do not let an idle ACL bulk-IN read hold up HCI event credits during ISO.
 // Number Of Completed Packets arrives on interrupt-IN and directly replenishes
 // the controller ISO queue; a 10 ms bulk poll here can miss an entire CIS interval.
@@ -74,6 +78,7 @@ pub(crate) fn open_be200_split_transport() -> TransportResult<SplitOpenedTranspo
     println!("[R2/USB] ACL lifecycle event tracing enabled before HCI decode; no ACL payloads or pairing keys logged");
 
     let handle = Arc::new(handle);
+    let iso_event_only = Arc::new(AtomicBool::new(false));
     let source = Be200UsbPacketSource {
         handle: handle.clone(),
         interrupt_in: layout.interrupt_in,
@@ -82,10 +87,12 @@ pub(crate) fn open_be200_split_transport() -> TransportResult<SplitOpenedTranspo
         acl_framer: UsbHciReassembler::acl(),
         pending: VecDeque::new(),
         next_poll_endpoint: 0,
+        iso_event_only: iso_event_only.clone(),
     };
     let sink = Be200UsbPacketSink {
         handle,
         bulk_out: layout.bulk_out,
+        iso_event_only,
     };
 
     let mut metadata = BTreeMap::new();
@@ -378,16 +385,22 @@ struct Be200UsbPacketSource {
     acl_framer: UsbHciReassembler,
     pending: VecDeque<HciPacket>,
     next_poll_endpoint: u8,
+    iso_event_only: Arc<AtomicBool>,
 }
 
 impl Be200UsbPacketSource {
     fn poll_events(&mut self) -> TransportResult<()> {
         let mut transfer = vec![0u8; MAX_HCI_PACKET_SIZE - 1];
+        let timeout = if self.iso_event_only.load(Ordering::Acquire) {
+            ISO_EVENT_READ_TIMEOUT
+        } else {
+            EVENT_READ_TIMEOUT
+        };
         let count = read_interrupt_preserving_progress(
             self.handle.as_ref(),
             self.interrupt_in,
             &mut transfer,
-            EVENT_READ_TIMEOUT,
+            timeout,
         )?;
         if count == 0 {
             return Ok(());
@@ -416,6 +429,9 @@ impl Be200UsbPacketSource {
     }
 
     fn poll_next_endpoint(&mut self) -> TransportResult<()> {
+        if self.iso_event_only.load(Ordering::Acquire) {
+            return self.poll_events();
+        }
         let endpoint = self.next_poll_endpoint;
         self.next_poll_endpoint ^= 1;
         if endpoint == 0 {
@@ -444,6 +460,7 @@ impl PacketSource for Be200UsbPacketSource {
 struct Be200UsbPacketSink {
     handle: Arc<DeviceHandle<Context>>,
     bulk_out: u8,
+    iso_event_only: Arc<AtomicBool>,
 }
 
 impl PacketSink for Be200UsbPacketSink {
@@ -452,6 +469,15 @@ impl PacketSink for Be200UsbPacketSink {
         let (&packet_type, payload) = bytes
             .split_first()
             .ok_or_else(|| Error::InvalidSpec("empty HCI packet".into()))?;
+
+        // Steady-state CIS streaming still requires HCI Event traffic for ISO
+        // credits, but it does not need inbound ACL polling. Enter event-only
+        // mode on ISO; any later command/ACL packet restores normal receive mode.
+        if packet_type == HCI_ISO_DATA_PACKET {
+            self.iso_event_only.store(true, Ordering::Release);
+        } else {
+            self.iso_event_only.store(false, Ordering::Release);
+        }
 
         let count = match packet_type {
             HCI_COMMAND_PACKET => self.handle.write_control(
