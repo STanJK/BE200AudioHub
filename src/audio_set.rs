@@ -211,6 +211,15 @@ fn inspect_impl(seconds: u16, wanted_name: &str, action: AudioSetAction) -> Resu
             "[R5.2/HOST] READY: bit32_enabled={} wrote_host_feature={}",
             report.enabled_after, report.set_command_sent
         );
+        // Previous R5.2-B run reached 2/2 CIS Established but sent an
+        // invalid Disconnect reason=0x16, leaving CIG 1 removal unconfirmed.
+        // The prior ACL disconnect implicitly terminated both CIS. Before
+        // another bonded connection, prove this CIG is absent or remove its
+        // inactive leftover allocation; fail closed if still active (0x0C).
+        attached.reconcile_test_cig_pre_acl(bap_client::FIRST_SOUND_CIG_ID)
+            .map_err(|error| AppError::Protocol(format!(
+                "R5.2-B pre-ACL residual CIG reconciliation failed: {error}"
+            )))?;
     }
 
     println!("Discovery scan: resolving all current member addresses in one {seconds}s window...");
