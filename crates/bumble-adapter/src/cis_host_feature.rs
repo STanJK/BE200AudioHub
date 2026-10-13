@@ -76,7 +76,7 @@ impl AttachedController {
         );
 
         if !initially_enabled {
-            if !names.contains(SET_HOST_FEATURE_COMMAND) {
+            if !names.contains(&SET_HOST_FEATURE_COMMAND) {
                 return Err(
                     "BE200 has CIS Central but does not advertise HCI LE Set Host Feature (0x2074); cannot enable bit32".into()
                 );
@@ -108,9 +108,9 @@ impl AttachedController {
 
         // The Host Feature is observable in the LE feature bitmap; treat
         // Command Complete alone as insufficient proof of support.
-        let read_command = if names.contains(READ_ALL_LE_FEATURES_COMMAND) {
+        let read_command = if names.contains(&READ_ALL_LE_FEATURES_COMMAND) {
             Command::LeReadAllLocalSupportedFeatures
-        } else if names.contains(READ_LE_FEATURES_COMMAND) {
+        } else if names.contains(&READ_LE_FEATURES_COMMAND) {
             Command::LeReadLocalSupportedFeatures
         } else {
             return Err(
