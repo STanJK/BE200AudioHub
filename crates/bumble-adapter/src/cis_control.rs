@@ -16,7 +16,19 @@ use crate::{AttachedController, CigAllocation};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT_SLICE: Duration = Duration::from_millis(250);
-const DISCONNECT_REASON_LOCAL_HOST: u8 = 0x16;
+// HCI Disconnect *command* Reason must be a remote-facing error code
+// permitted by Core Vol 4, Part E, 7.1.6. 0x16 is reserved here for the
+// *local Disconnection Complete event*, not the command parameter.
+// Our first BE200 R5.2-B HIL sent 0x16 and both Disconnect Command Status
+// events returned 0x12 (Invalid HCI Command Parameters).
+const DISCONNECT_REASON_REMOTE_USER_TERMINATED: u8 = 0x13;
+
+fn cis_disconnect_command(connection_handle: u16) -> Command {
+    Command::Disconnect {
+        connection_handle,
+        reason: DISCONNECT_REASON_REMOTE_USER_TERMINATED,
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EstablishedCis {
@@ -220,10 +232,7 @@ impl AttachedController {
                 continue;
             }
             let response = self.host.send_command(
-                Command::Disconnect {
-                    connection_handle: handle,
-                    reason: DISCONNECT_REASON_LOCAL_HOST,
-                },
+                cis_disconnect_command(handle),
                 COMMAND_TIMEOUT,
             );
             match response {
@@ -304,6 +313,14 @@ mod tests {
             max_pdu_c_to_p: 100, max_pdu_p_to_c: 0,
             iso_interval: 8,
         }
+    }
+
+    #[test]
+    fn cis_disconnect_command_uses_remote_facing_reason_0x13_not_event_reason_0x16() {
+        let bytes = cis_disconnect_command(0x0900).to_bytes();
+        // H4 Command, HCI_Disconnect opcode 0x0406, 3 bytes: handle + reason.
+        assert_eq!(bytes, [0x01, 0x06, 0x04, 0x03, 0x00, 0x09, 0x13]);
+        assert_ne!(bytes[6], 0x16);
     }
 
     #[test]
